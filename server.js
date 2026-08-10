@@ -1,3 +1,76 @@
+const express = require('express');
+const axios = require('axios');
+const cheerio = require('cheerio');
+const cors = require('cors');
+
+const app = express();
+app.use(cors());
+
+// ---------- HELPERS ----------
+function buildEmbedUrl(source, id, season, episode) {
+  const s = source.toLowerCase();
+  if (s.includes('vsembed_ru')) {
+    return season
+      ? `https://vsembed.ru/embed/tv/${id}/${season}/${episode}`
+      : `https://vsembed.ru/embed/movie/${id}`;
+  }
+  if (s.includes('vsembed_su')) {
+    return season
+      ? `https://vsembed.su/embed/tv/${id}/${season}/${episode}`
+      : `https://vsembed.su/embed/movie/${id}`;
+  }
+  if (s.includes('vidsrcme_ru')) {
+    return season
+      ? `https://vidsrcme.ru/embed/tv/${id}/${season}/${episode}`
+      : `https://vidsrcme.ru/embed/movie/${id}`;
+  }
+  if (s.includes('vidsrcme_su')) {
+    return season
+      ? `https://vidsrcme.su/embed/tv/${id}/${season}/${episode}`
+      : `https://vidsrcme.su/embed/movie/${id}`;
+  }
+  return null;
+}
+
+// ---------- EXTRACTION LOGIC PER PROVIDER ----------
+async function extractVSembed(html) {
+  const $ = cheerio.load(html);
+  let videoUrl = $('video source').first().attr('src');
+  if (videoUrl) return videoUrl;
+
+  const scriptMatch = html.match(/source\s*:\s*['"]([^'"]+)['"]/);
+  if (scriptMatch) return scriptMatch[1];
+
+  const linkMatch = html.match(/(https?:\/\/[^"'\s]+\.(?:mp4|m3u8|mpd)[^"'\s]*)/i);
+  if (linkMatch) return linkMatch[0];
+
+  return null;
+}
+
+async function extractVidsrcme(html) {
+  const $ = cheerio.load(html);
+  const iframeSrc = $('iframe').first().attr('src');
+  if (iframeSrc) {
+    try {
+      const resp = await axios.get(iframeSrc);
+      return await extractGeneric(resp.data);
+    } catch (e) { /* ignore */ }
+  }
+  const match = html.match(/file\s*:\s*['"]([^'"]+)['"]/);
+  if (match) return match[1];
+  return await extractGeneric(html);
+}
+
+async function extractGeneric(html) {
+  const $ = cheerio.load(html);
+  let videoUrl = $('video source').first().attr('src');
+  if (videoUrl) return videoUrl;
+  const scriptRegex = /['"](https?:\/\/[^"']+\.(?:mp4|m3u8|mpd)[^"']*)['"]/gi;
+  const matches = html.match(scriptRegex);
+  if (matches) return matches[0].replace(/['"]/g, '');
+  return null;
+}
+
 // ---------- ROUTES ----------
 app.get('/proxy', async (req, res) => {
   const { source, id, season, episode } = req.query;
@@ -32,7 +105,7 @@ app.get('/proxy', async (req, res) => {
         error: 'No video URL found',
         embedUrl,
         pageTitle: html.match(/<title>(.*?)<\/title>/i)?.[1] || 'no title',
-        snippet: html.substring(0, 1000)  // first 1000 chars for inspection
+        snippet: html.substring(0, 1000)
       });
     }
 
@@ -56,3 +129,9 @@ app.get('/proxy', async (req, res) => {
     res.status(500).json({ error: 'Proxy error', details: err.message });
   }
 });
+
+// Health check
+app.get('/', (req, res) => res.send('Video Ad Proxy is running'));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
