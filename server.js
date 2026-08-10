@@ -38,7 +38,7 @@ function buildEmbedUrl(source, id, season, episode) {
   return null;
 }
 
-// ---------- EMBED PROXY (improved) ----------
+// ---------- EMBED PROXY ----------
 app.get('/embed-proxy', async (req, res) => {
   const { source, id, season, episode } = req.query;
   if (!source || !id) return res.status(400).send('Missing source or id');
@@ -83,44 +83,50 @@ app.get('/embed-proxy', async (req, res) => {
       }
     );
 
-    // Inject script that waits for the player and posts the video URL
+    // Enhanced injected script with error reporting and parent messaging
     const injectedScript = `
       <script>
         (function() {
+          function postDebug(msg, isError) {
+            window.parent.postMessage({ type: 'debug', message: msg, error: !!isError }, '*');
+          }
+          // Catch global errors
+          window.onerror = function(message, source, lineno, colno, error) {
+            postDebug('JS error: ' + message + ' at ' + source + ':' + lineno, true);
+          };
+          postDebug('Script loaded');
+
           function findVideo() {
             var video = document.querySelector('video');
             if (video && video.src && video.src.startsWith('http')) {
+              postDebug('Found video element: ' + video.src);
               window.parent.postMessage({ type: 'video-ready', src: video.src }, '*');
               return true;
             }
-            // Also check for source elements
             var source = document.querySelector('video source');
             if (source && source.src && source.src.startsWith('http')) {
+              postDebug('Found video source: ' + source.src);
               window.parent.postMessage({ type: 'video-ready', src: source.src }, '*');
               return true;
             }
+            // Also check for any iframes that might contain the player
+            var iframes = document.querySelectorAll('iframe');
+            postDebug('Found ' + iframes.length + ' iframes on page');
             return false;
           }
 
-          if (document.readyState === 'complete' || document.readyState === 'interactive') {
-            // already loaded
-            var attempts = 0;
-            var timer = setInterval(function() {
-              if (findVideo() || attempts > 30) { // 15 seconds max
-                clearInterval(timer);
-              }
-              attempts++;
-            }, 500);
+          function waitForVideo() {
+            if (findVideo()) return;
+            setTimeout(waitForVideo, 800);
+          }
+
+          if (document.readyState === 'complete') {
+            postDebug('Document already complete');
+            waitForVideo();
           } else {
             window.addEventListener('load', function() {
-              findVideo();
-              var attempts = 0;
-              var timer = setInterval(function() {
-                if (findVideo() || attempts > 30) {
-                  clearInterval(timer);
-                }
-                attempts++;
-              }, 500);
+              postDebug('Document loaded');
+              waitForVideo();
             });
           }
         })();
@@ -137,7 +143,7 @@ app.get('/embed-proxy', async (req, res) => {
   }
 });
 
-// ---------- FETCH PROXY (serve any resource) ----------
+// ---------- FETCH PROXY ----------
 app.get('/fetch-proxy', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send('Missing url');
@@ -145,26 +151,24 @@ app.get('/fetch-proxy', async (req, res) => {
   try {
     const response = await axios.get(url, {
       responseType: 'stream',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
+      headers: { 'User-Agent': 'Mozilla/5.0' }
     });
     const contentType = response.headers['content-type'] || 'application/octet-stream';
     res.set('Content-Type', contentType);
-    // Allow CORS for any resource
     res.set('Access-Control-Allow-Origin', '*');
     response.data.pipe(res);
   } catch (err) {
-    res.status(500).send('Fetch error');
+    console.error('Fetch proxy error for', url, err.message);
+    res.status(502).send('Resource fetch failed');
   }
 });
 
-// ---------- DIRECT PROXY (fallback) ----------
+// ---------- DIRECT PROXY (unchanged) ----------
 app.get('/proxy', async (req, res) => {
-  // ... (your existing /proxy code) ...
+  // ... keep your existing /proxy code ...
 });
 
-// ... other routes
+app.get('/', (req, res) => res.send('Video Ad Proxy is running'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
