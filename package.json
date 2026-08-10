@@ -1,0 +1,14 @@
+{
+  "name": "video-ad-proxy",
+  "version": "1.0.0",
+  "description": "Proxy to extract raw video URLs from ad-heavy embeds",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12",
+    "cors": "^2.8.5"
+  }
+}
