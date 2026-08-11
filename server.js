@@ -25,7 +25,7 @@ function buildEmbedUrl(source, id, season, episode) {
   return null;
 }
 
-// ---------- NEW: pass‑through embed page ----------
+// ---------- SPY EMBED (no ad removal, just reporting) ----------
 app.get('/embed-view', async (req, res) => {
   const { source, id, season, episode } = req.query;
   if (!source || !id) return res.status(400).send('Missing params');
@@ -34,33 +34,74 @@ app.get('/embed-view', async (req, res) => {
   if (!targetUrl) return res.status(400).send('Unsupported source');
 
   try {
-    console.log(`[Embed-View] Fetching: ${targetUrl}`);
+    console.log(`[Spy] Fetching: ${targetUrl}`);
     const response = await axios.get(targetUrl, {
       responseType: 'text',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'text/html,application/xhtml+xml'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
     });
 
     let html = response.data;
     const baseUrl = new URL(targetUrl);
 
-    // Insert <base> so relative URLs still load from the original domain
+    // Insert <base> to keep relative URLs working
     html = html.replace('<head>', `<head><base href="${baseUrl.origin}/">`);
 
-    // Optional: Remove common pop‑up scripts (light ad blocking)
-    html = html.replace(/<script[^>]*src="[^"]*(?:popads|adsterra|propeller|histats|llvpn|ad)[^"]*"[^>]*><\/script>/gi, '');
+    // Inject spy script
+    const spyScript = `
+      <script>
+        (function() {
+          function report(tag, url) {
+            try {
+              const domain = new URL(url, document.baseURI).hostname;
+              window.parent.postMessage({ type: 'ad-spy', tag: tag, domain: domain, url: url }, '*');
+            } catch(e) {}
+          }
+          // Observe new elements added to the DOM
+          const observer = new MutationObserver(function(mutations) {
+            mutations.forEach(function(mutation) {
+              mutation.addedNodes.forEach(function(node) {
+                if (node.nodeType === 1) {
+                  // Check the element itself
+                  if (node.tagName === 'SCRIPT' && node.src) report('script', node.src);
+                  if (node.tagName === 'IFRAME' && node.src) report('iframe', node.src);
+                  if (node.tagName === 'IMG' && node.src) report('img', node.src);
+                  if (node.tagName === 'LINK' && node.href && node.rel === 'stylesheet') report('css', node.href);
+                  // Also check children
+                  node.querySelectorAll('script[src], iframe[src], img[src], link[rel="stylesheet"]').forEach(function(el) {
+                    if (el.tagName === 'SCRIPT' || el.tagName === 'IFRAME' || el.tagName === 'IMG') report(el.tagName.toLowerCase(), el.src);
+                    if (el.tagName === 'LINK') report('css', el.href);
+                  });
+                }
+              });
+            });
+          });
+          observer.observe(document.documentElement, { childList: true, subtree: true });
+
+          // Report already loaded elements
+          document.querySelectorAll('script[src], iframe[src], img[src], link[rel="stylesheet"]').forEach(function(el) {
+            if (el.tagName === 'SCRIPT' || el.tagName === 'IFRAME' || el.tagName === 'IMG') report(el.tagName.toLowerCase(), el.src);
+            if (el.tagName === 'LINK') report('css', el.href);
+          });
+
+          window.addEventListener('load', function() {
+            window.parent.postMessage({ type: 'ad-spy-done' }, '*');
+          });
+        })();
+      </script>
+    `;
+
+    html = html.replace('</body>', spyScript + '</body>');
 
     res.set('Content-Type', 'text/html');
     res.send(html);
   } catch (err) {
-    console.error('[Embed-View] Error:', err.message);
+    console.error('[Spy] Error:', err.message);
     res.status(502).send('Failed to load embed page');
   }
 });
 
-// Keep /raw-html for debugging
 app.get('/raw-html', async (req, res) => {
   const { source, id, season, episode } = req.query;
   if (!source || !id) return res.status(400).send('Missing params');
