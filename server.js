@@ -1,5 +1,6 @@
 const express = require('express');
 const axios = require('axios');
+const cheerio = require('cheerio');
 const cors = require('cors');
 
 const app = express();
@@ -25,7 +26,70 @@ function buildEmbedUrl(source, id, season, episode) {
   return null;
 }
 
-// ---------- AD‑FREE EMBED (with CSP blocking) ----------
+// Extract the first iframe src from HTML
+function extractIframeSrc(html) {
+  const $ = cheerio.load(html);
+  return $('iframe').first().attr('src') || null;
+}
+
+// Extract video URL from a page (generic)
+function extractVideoFromPage(html) {
+  const $ = cheerio.load(html);
+  let src = $('video').attr('src');
+  if (src && src.startsWith('http')) return src;
+  src = $('video source').first().attr('src');
+  if (src && src.startsWith('http')) return src;
+  const match = html.match(/(https?:\/\/[^"'\s]+\.(?:mp4|m3u8|mpd)[^"'\s]*)/i);
+  if (match) return match[0];
+  return null;
+}
+
+// ---------- DEEP EXTRACTION (vsembed → cloudorchestranova → video) ----------
+app.get('/extract-deep', async (req, res) => {
+  const { source, id, season, episode } = req.query;
+  if (!source || !id) return res.status(400).json({ error: 'Missing params' });
+
+  const embedUrl = buildEmbedUrl(source, id, season, episode);
+  if (!embedUrl) return res.status(400).json({ error: 'Unsupported source' });
+
+  try {
+    console.log(`[Deep] Step 1 – fetch embed: ${embedUrl}`);
+    const { data: html } = await axios.get(embedUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+
+    // 1. Find the nested iframe (cloudorchestranova.com)
+    const iframeSrc = extractIframeSrc(html);
+    if (!iframeSrc) {
+      return res.status(404).json({ error: 'No nested iframe found', snippet: html.substring(0, 500) });
+    }
+
+    const iframeUrl = iframeSrc.startsWith('http') ? iframeSrc : new URL(iframeSrc, embedUrl).href;
+    console.log(`[Deep] Step 2 – fetch nested iframe: ${iframeUrl}`);
+
+    // 2. Fetch the nested iframe page
+    const { data: iframeHtml } = await axios.get(iframeUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0',
+        'Referer': embedUrl   // important: pretend we came from the embed page
+      }
+    });
+
+    // 3. Extract video URL
+    const videoUrl = extractVideoFromPage(iframeHtml);
+    if (!videoUrl) {
+      return res.status(404).json({ error: 'No video found in nested iframe', snippet: iframeHtml.substring(0, 500) });
+    }
+
+    console.log(`[Deep] Success! Video URL: ${videoUrl}`);
+    res.json({ videoUrl });
+  } catch (err) {
+    console.error('[Deep] Error:', err.message);
+    res.status(500).json({ error: 'Deep extraction failed', details: err.message });
+  }
+});
+
+// ---------- AD‑FREE EMBED (fallback, with CSP) ----------
 app.get('/embed-view', async (req, res) => {
   const { source, id, season, episode } = req.query;
   if (!source || !id) return res.status(400).send('Missing params');
@@ -37,75 +101,33 @@ app.get('/embed-view', async (req, res) => {
     console.log(`[AdFree] Fetching: ${targetUrl}`);
     const response = await axios.get(targetUrl, {
       responseType: 'text',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
+      headers: { 'User-Agent': 'Mozilla/5.0' }
     });
 
     let html = response.data;
     const baseUrl = new URL(targetUrl);
-
-    // Insert <base> to keep relative URLs working
     html = html.replace('<head>', `<head><base href="${baseUrl.origin}/">`);
 
-    // Remove or replace known ad script tags (optional extra safety)
-    html = html.replace(/<script[^>]*src="[^"]*(?:popads|adsterra|propeller|histats|llvpn|onaudience|dtscout|dtscdn|crwdcntrl|mrktmtrcs)[^"]*"[^>]*><\/script>/gi, '');
-
-    // Set Content‑Security‑Policy to block all known ad/tracking domains
-    res.set('Content-Security-Policy', [
-      "default-src * 'unsafe-inline' 'unsafe-eval'",
-      "script-src * 'unsafe-inline' 'unsafe-eval'",
-      "style-src * 'unsafe-inline'",
-      "img-src * data:",
-      "connect-src *",
-      "frame-src *",
-      // Block specific ad domains (still allow everything else)
-      "block-all-mixed-content",
-      // Optionally we can disallow those domains using 'none' but it's easier to just not block them because default is *.
-      // We'll use a more targeted approach: block by domain pattern.
-      "script-src 'unsafe-inline' 'unsafe-eval' *",
-      "script-src-elem 'unsafe-inline' 'unsafe-eval' *",
-      // No, CSP doesn't support negative lists. Instead, we'll use the removal above and also
-      // block these domains via the fetch directive? Not directly.
-      // The simplest effective way is to remove the script tags server-side (already done) and also
-      // block them in the browser via a meta tag. We'll add a meta CSP that disallows those domains.
-    ].join('; '));
-
-    // Better: Add a <meta> tag that blocks those domains using the `content` attribute.
-    // CSP can't easily block specific domains while allowing all others; but we can set a policy that only
-    // allows certain domains. We need to know the essential domains. From the spy, the video is on
-    // cloudorchestranova.com. vsembed.ru itself loads scripts from its own domain. We can whitelist those
-    // and block everything else. That's more secure.
-
-    // For simplicity, we'll set CSP to only allow:
-    // - 'self' (proxy domain)
-    // - vsembed.ru and its subresources
-    // - cloudorchestranova.com
-    // - cdn.jsdelivr.net (if any)
-    // - fonts.googleapis.com, fonts.gstatic.com (if needed)
-    // This will block all ad domains.
-
+    // CSP – allow only essential domains
     const csp = [
       "default-src 'self'",
-      `script-src 'self' 'unsafe-inline' 'unsafe-eval' https://vsembed.ru https://*.vsembed.ru https://cloudorchestranova.com https://cdn.jsdelivr.net`,
-      `style-src 'self' 'unsafe-inline' https://vsembed.ru https://fonts.googleapis.com`,
-      `img-src 'self' data: https://vsembed.ru https://*.vsembed.ru https://cloudorchestranova.com`,
-      `frame-src 'self' https://vsembed.ru https://cloudorchestranova.com`,
-      `connect-src 'self' https://vsembed.ru https://cloudorchestranova.com`,
-      `font-src 'self' https://fonts.gstatic.com`,
+      "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://vsembed.ru https://*.vsembed.ru https://cloudorchestranova.com https://cdn.jsdelivr.net",
+      "style-src 'self' 'unsafe-inline' https://vsembed.ru https://fonts.googleapis.com",
+      "img-src 'self' data: https://vsembed.ru https://*.vsembed.ru https://cloudorchestranova.com",
+      "frame-src 'self' https://vsembed.ru https://cloudorchestranova.com",
+      "connect-src 'self' https://vsembed.ru https://cloudorchestranova.com",
+      "font-src 'self' https://fonts.gstatic.com",
     ].join('; ');
 
     res.set('Content-Security-Policy', csp);
     res.set('Content-Type', 'text/html');
     res.send(html);
-
   } catch (err) {
     console.error('[AdFree] Error:', err.message);
     res.status(502).send('Failed to load embed page');
   }
 });
 
-// Keep /raw-html for debugging
 app.get('/raw-html', async (req, res) => {
   const { source, id, season, episode } = req.query;
   if (!source || !id) return res.status(400).send('Missing params');
