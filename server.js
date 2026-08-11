@@ -25,7 +25,7 @@ function buildEmbedUrl(source, id, season, episode) {
   return null;
 }
 
-// ---------- SPY EMBED (no ad removal, just reporting) ----------
+// ---------- AD‑FREE EMBED (with CSP blocking) ----------
 app.get('/embed-view', async (req, res) => {
   const { source, id, season, episode } = req.query;
   if (!source || !id) return res.status(400).send('Missing params');
@@ -34,7 +34,7 @@ app.get('/embed-view', async (req, res) => {
   if (!targetUrl) return res.status(400).send('Unsupported source');
 
   try {
-    console.log(`[Spy] Fetching: ${targetUrl}`);
+    console.log(`[AdFree] Fetching: ${targetUrl}`);
     const response = await axios.get(targetUrl, {
       responseType: 'text',
       headers: {
@@ -48,60 +48,64 @@ app.get('/embed-view', async (req, res) => {
     // Insert <base> to keep relative URLs working
     html = html.replace('<head>', `<head><base href="${baseUrl.origin}/">`);
 
-    // Inject spy script
-    const spyScript = `
-      <script>
-        (function() {
-          function report(tag, url) {
-            try {
-              const domain = new URL(url, document.baseURI).hostname;
-              window.parent.postMessage({ type: 'ad-spy', tag: tag, domain: domain, url: url }, '*');
-            } catch(e) {}
-          }
-          // Observe new elements added to the DOM
-          const observer = new MutationObserver(function(mutations) {
-            mutations.forEach(function(mutation) {
-              mutation.addedNodes.forEach(function(node) {
-                if (node.nodeType === 1) {
-                  // Check the element itself
-                  if (node.tagName === 'SCRIPT' && node.src) report('script', node.src);
-                  if (node.tagName === 'IFRAME' && node.src) report('iframe', node.src);
-                  if (node.tagName === 'IMG' && node.src) report('img', node.src);
-                  if (node.tagName === 'LINK' && node.href && node.rel === 'stylesheet') report('css', node.href);
-                  // Also check children
-                  node.querySelectorAll('script[src], iframe[src], img[src], link[rel="stylesheet"]').forEach(function(el) {
-                    if (el.tagName === 'SCRIPT' || el.tagName === 'IFRAME' || el.tagName === 'IMG') report(el.tagName.toLowerCase(), el.src);
-                    if (el.tagName === 'LINK') report('css', el.href);
-                  });
-                }
-              });
-            });
-          });
-          observer.observe(document.documentElement, { childList: true, subtree: true });
+    // Remove or replace known ad script tags (optional extra safety)
+    html = html.replace(/<script[^>]*src="[^"]*(?:popads|adsterra|propeller|histats|llvpn|onaudience|dtscout|dtscdn|crwdcntrl|mrktmtrcs)[^"]*"[^>]*><\/script>/gi, '');
 
-          // Report already loaded elements
-          document.querySelectorAll('script[src], iframe[src], img[src], link[rel="stylesheet"]').forEach(function(el) {
-            if (el.tagName === 'SCRIPT' || el.tagName === 'IFRAME' || el.tagName === 'IMG') report(el.tagName.toLowerCase(), el.src);
-            if (el.tagName === 'LINK') report('css', el.href);
-          });
+    // Set Content‑Security‑Policy to block all known ad/tracking domains
+    res.set('Content-Security-Policy', [
+      "default-src * 'unsafe-inline' 'unsafe-eval'",
+      "script-src * 'unsafe-inline' 'unsafe-eval'",
+      "style-src * 'unsafe-inline'",
+      "img-src * data:",
+      "connect-src *",
+      "frame-src *",
+      // Block specific ad domains (still allow everything else)
+      "block-all-mixed-content",
+      // Optionally we can disallow those domains using 'none' but it's easier to just not block them because default is *.
+      // We'll use a more targeted approach: block by domain pattern.
+      "script-src 'unsafe-inline' 'unsafe-eval' *",
+      "script-src-elem 'unsafe-inline' 'unsafe-eval' *",
+      // No, CSP doesn't support negative lists. Instead, we'll use the removal above and also
+      // block these domains via the fetch directive? Not directly.
+      // The simplest effective way is to remove the script tags server-side (already done) and also
+      // block them in the browser via a meta tag. We'll add a meta CSP that disallows those domains.
+    ].join('; '));
 
-          window.addEventListener('load', function() {
-            window.parent.postMessage({ type: 'ad-spy-done' }, '*');
-          });
-        })();
-      </script>
-    `;
+    // Better: Add a <meta> tag that blocks those domains using the `content` attribute.
+    // CSP can't easily block specific domains while allowing all others; but we can set a policy that only
+    // allows certain domains. We need to know the essential domains. From the spy, the video is on
+    // cloudorchestranova.com. vsembed.ru itself loads scripts from its own domain. We can whitelist those
+    // and block everything else. That's more secure.
 
-    html = html.replace('</body>', spyScript + '</body>');
+    // For simplicity, we'll set CSP to only allow:
+    // - 'self' (proxy domain)
+    // - vsembed.ru and its subresources
+    // - cloudorchestranova.com
+    // - cdn.jsdelivr.net (if any)
+    // - fonts.googleapis.com, fonts.gstatic.com (if needed)
+    // This will block all ad domains.
 
+    const csp = [
+      "default-src 'self'",
+      `script-src 'self' 'unsafe-inline' 'unsafe-eval' https://vsembed.ru https://*.vsembed.ru https://cloudorchestranova.com https://cdn.jsdelivr.net`,
+      `style-src 'self' 'unsafe-inline' https://vsembed.ru https://fonts.googleapis.com`,
+      `img-src 'self' data: https://vsembed.ru https://*.vsembed.ru https://cloudorchestranova.com`,
+      `frame-src 'self' https://vsembed.ru https://cloudorchestranova.com`,
+      `connect-src 'self' https://vsembed.ru https://cloudorchestranova.com`,
+      `font-src 'self' https://fonts.gstatic.com`,
+    ].join('; ');
+
+    res.set('Content-Security-Policy', csp);
     res.set('Content-Type', 'text/html');
     res.send(html);
+
   } catch (err) {
-    console.error('[Spy] Error:', err.message);
+    console.error('[AdFree] Error:', err.message);
     res.status(502).send('Failed to load embed page');
   }
 });
 
+// Keep /raw-html for debugging
 app.get('/raw-html', async (req, res) => {
   const { source, id, season, episode } = req.query;
   if (!source || !id) return res.status(400).send('Missing params');
